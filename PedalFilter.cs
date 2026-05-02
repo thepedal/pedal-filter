@@ -1,18 +1,16 @@
-// Pedal Filter – ReBuzz managed effect machine  (v3)
+// Pedal Filter – ReBuzz managed effect machine  (v6)
 //
 // Multi-mode filter with:
 //   • Low Pass / High Pass / Band Pass / Band Reject (Notch) modes
 //   • 12 dB/oct (2-pole) and 24 dB/oct (4-pole, cascaded TPT SVF) slopes
-//   • Drive  – tanh() soft-clipper pre-filter
+//   • Drive  – tanh() soft-clipper pre-filter (normalised, level-independent)
 //   • LFO    – 5 waveforms, free-running or tempo-synced (14 divisions)
 //   • Stereo LFO phase offset
 //   • Wet/dry mix
+//   • CPU silence detection: stops processing when input is silent and
+//     filter state has fully drained
 //
-// v3 change: Chamberlin SVF replaced with TPT (Topology-Preserving Transform)
-// SVF (Zavalishin).  The TPT SVF solves the two integrator equations
-// algebraically per sample, making it unconditionally stable at ALL cutoff
-// frequencies — including close to Nyquist — where the old Chamberlin SVF
-// would diverge and produce an extremely loud volume spike.
+// TPT SVF (Zavalishin) is unconditionally stable at all cutoff frequencies.
 //
 // Build:
 //   dotnet build PedalFilter.csproj -c Release
@@ -62,30 +60,28 @@ namespace WDE.PedalFilter
         readonly IBuzzMachineHost host;
 
         // ── TPT SVF integrator states ─────────────────────────────────────────
-        // s1 = first integrator output (band-pass state)
-        // s2 = second integrator output (low-pass state)
-        // Stage 1 (both poles / modes)
+        // s1 = first integrator  (tracks band-pass)
+        // s2 = second integrator (tracks low-pass)
         double s1_L1, s2_L1;   // Left  stage 1
         double s1_R1, s2_R1;   // Right stage 1
-        // Stage 2 (4-pole cascade only)
-        double s1_L2, s2_L2;   // Left  stage 2
-        double s1_R2, s2_R2;   // Right stage 2
+        double s1_L2, s2_L2;   // Left  stage 2  (4-pole only)
+        double s1_R2, s2_R2;   // Right stage 2  (4-pole only)
 
         // ── LFO ──────────────────────────────────────────────────────────────
         double lfoPhaseL;   // normalised 0..1
 
         // ── Drive peak tracker ────────────────────────────────────────────────
-        // Tracks the running peak amplitude per channel so that the tanh
-        // saturator is normalised to ±1 before clipping and then scaled back
-        // out.  This makes Drive level-independent: it behaves the same whether
-        // the upstream chain runs at ±1 or ±32 768.
-        // Initialised to a small non-zero value to avoid divide-by-zero.
         double _drivePeakL = 1e-6;
         double _drivePeakR = 1e-6;
 
+        // ── Silence detection threshold ───────────────────────────────────────
+        // Absolute value below which a sample or integrator state is considered
+        // inaudible.  −120 dBFS relative to Buzz full-scale (±32768):
+        //   32768 × 10^(−120/20) ≈ 0.033
+        // Using a slightly tighter value keeps tails clean without wasting CPU.
+        const double SILENCE_THRESHOLD = 0.001;
+
         // ── Tempo-sync division table ─────────────────────────────────────────
-        // Values are note lengths in quarter-note beats.
-        // cycle length in seconds = beats × (60 / BPM)
         static readonly double[] DivBeats =
         {
             16.0,        //  0 – 4 Bars
@@ -224,14 +220,46 @@ namespace WDE.PedalFilter
 
         public bool Work(Sample[] output, Sample[] input, int n, WorkModes mode)
         {
+            // ── Silence detection ─────────────────────────────────────────────
+            //
+            // ReBuzz sets WorkModes.WM_READ when the upstream machine is
+            // producing a non-silent signal.  When that flag is absent, the
+            // input buffer is silent (all zeros or not filled at all).
+            //
+            // We must NOT return false immediately when input goes silent —
+            // the filter integrators hold energy that must drain first or we
+            // cut off resonant tails with a click.  Instead:
+            //
+            //   • If input is silent AND all integrator states are already
+            //     below the inaudible threshold: return false right away
+            //     (states are already zero, nothing to drain).
+            //
+            //   • If input is silent BUT integrators still hold energy:
+            //     run the full processing loop this buffer with silent input
+            //     so the states continue decaying naturally.  Return true so
+            //     ReBuzz keeps calling us until they drain.
+            //
+            //   • If input is live: always run normally and return true.
+            //
+            // When we return false, ReBuzz marks our output as silent and
+            // stops calling Work() until a new non-silent input arrives.
+            // At that point the integrator states are at or below
+            // SILENCE_THRESHOLD, so there is no click on resumption.
+
+            bool inputActive = (mode & WorkModes.WM_READ) != 0;
+
+            if (!inputActive && StatesAreSilent())
+                return false;   // nothing to process, nothing to drain
+
+            // ------------------------------------------------------------------
+            // Block-level constants
+            // ------------------------------------------------------------------
             double sr  = host.MasterInfo.SamplesPerSec;
             double wet = Mix  / 100.0;
             double dry = 1.0 - wet;
 
-            // Drive: 0 % → gain 1×  /  100 % → gain 10×  (into tanh)
             double driveGain = 1.0 + (Drive / 100.0) * 9.0;
 
-            // LFO rate
             double lfoHz;
             if (TempoSync == 1)
             {
@@ -245,23 +273,18 @@ namespace WDE.PedalFilter
                 lfoHz = LfoRate / 10.0;
             }
 
-            double lfoInc = (lfoHz > 0.0) ? lfoHz / sr : 0.0;
-
-            // Cutoff & modulation
-            // Hard ceiling at sr*0.499 — tan(π*0.499) ≈ 314, finite and safe.
+            double lfoInc       = (lfoHz > 0.0) ? lfoHz / sr : 0.0;
             double baseCutoff   = Math.Clamp(CutoffHz, 20.0, sr * 0.499);
             double depthOct     = LfoDepth / 100.0 * 4.0;
-
-            // TPT SVF damping coefficient R.
-            // R = 1.0 → flat (Butterworth), R → 0 → self-oscillation.
-            // We keep R ≥ 0.005 so it never quite reaches true self-oscillation.
-            double R = 1.0 - (Resonance / 100.0) * 0.995;   // 1.0 → 0.005
-
+            double R            = 1.0 - (Resonance / 100.0) * 0.995;
             double phaseOffNorm = PhaseOffset / 360.0;
-            var    filterMode   = (FilterMode)Math.Clamp(Mode, 0, 3);
-            bool   fourPole     = (Slope == 1);
 
-            // ── Sample loop ───────────────────────────────────────────────────
+            var  filterMode = (FilterMode)Math.Clamp(Mode, 0, 3);
+            bool fourPole   = (Slope == 1);
+
+            // ------------------------------------------------------------------
+            // Sample loop
+            // ------------------------------------------------------------------
             for (int i = 0; i < n; i++)
             {
                 // LFO
@@ -277,32 +300,18 @@ namespace WDE.PedalFilter
                 double fcL = Math.Clamp(baseCutoff * Math.Pow(2.0, lfoL * depthOct), 20.0, sr * 0.499);
                 double fcR = Math.Clamp(baseCutoff * Math.Pow(2.0, lfoR * depthOct), 20.0, sr * 0.499);
 
-                // TPT g coefficient: g = tan(π·fc/sr)
-                // As fc → Nyquist, g → ∞ BUT the denominator (1+2Rg+g²) → ∞
-                // faster, so hp → 0.  No instability at any frequency.
                 double gL = Math.Tan(Math.PI * fcL / sr);
                 double gR = Math.Tan(Math.PI * fcR / sr);
 
-                // Drive (pre-filter soft saturation)
-                //
-                // IMPORTANT: when Drive = 0 the signal must pass through
-                // completely unmodified.  Even with gain = 1, Math.Tanh()
-                // compresses large-amplitude signals to the ±1 output range
-                // of tanh — causing drastic level loss at any signal amplitude
-                // larger than a few units.
-                //
-                // When Drive > 0 we use a self-scaling normalised tanh:
-                //   1. Track the running peak per channel (instant attack,
-                //      ~160 ms half-life release at 44 100 Hz).
-                //   2. Divide by peak  →  input is normalised to ±1.
-                //   3. Apply tanh with drive gain  →  saturation at ±1.
-                //   4. Multiply by peak again  →  restore original amplitude scale.
-                //
-                // This makes Drive work identically at any signal amplitude.
+                // Drive
+                // When Drive = 0 the input passes through unmodified.
+                // When Drive > 0 a normalised tanh saturator is applied:
+                //   divide by running peak  →  tanh with drive gain  →  multiply back.
+                // This makes the saturation character independent of signal level.
                 double inL, inR;
                 if (Drive > 0)
                 {
-                    const double peakDecay = 0.9999;
+                    const double peakDecay = 0.9999;   // ≈ 160 ms half-life @ 44.1 kHz
                     _drivePeakL = Math.Max(Math.Abs(input[i].L), _drivePeakL * peakDecay);
                     _drivePeakR = Math.Max(Math.Abs(input[i].R), _drivePeakR * peakDecay);
                     inL = Math.Tanh(input[i].L / _drivePeakL * driveGain) * _drivePeakL;
@@ -310,7 +319,6 @@ namespace WDE.PedalFilter
                 }
                 else
                 {
-                    // Exact bypass — zero processing, zero level change.
                     inL = input[i].L;
                     inR = input[i].R;
                 }
@@ -330,15 +338,13 @@ namespace WDE.PedalFilter
                 }
                 else
                 {
-                    // 4-pole: feed stage-1 selected output into stage 2.
-                    // Both stages run at the same g and R so the combined
-                    // roll-off is 24 dB/oct with a consistent resonance peak.
-                    double feed1L = SelectMode(filterMode, lp1L, hp1L, bp1L, no1L);
-                    double feed1R = SelectMode(filterMode, lp1R, hp1R, bp1R, no1R);
+                    // 4-pole: feed stage-1 selected output into stage 2
+                    double f1L = SelectMode(filterMode, lp1L, hp1L, bp1L, no1L);
+                    double f1R = SelectMode(filterMode, lp1R, hp1R, bp1R, no1R);
 
-                    TptSvfStep(feed1L, gL, R, ref s1_L2, ref s2_L2,
+                    TptSvfStep(f1L, gL, R, ref s1_L2, ref s2_L2,
                                out double hp2L, out double bp2L, out double lp2L, out double no2L);
-                    TptSvfStep(feed1R, gR, R, ref s1_R2, ref s2_R2,
+                    TptSvfStep(f1R, gR, R, ref s1_R2, ref s2_R2,
                                out double hp2R, out double bp2R, out double lp2R, out double no2R);
 
                     filtL = SelectMode(filterMode, lp2L, hp2L, bp2L, no2L);
@@ -353,47 +359,49 @@ namespace WDE.PedalFilter
         }
 
         // =========================================================================
-        // TPT SVF (Zavalishin)
+        // Silence helper
+        // =========================================================================
+
+        /// <summary>
+        /// Returns true when all four pairs of TPT integrator states are below
+        /// SILENCE_THRESHOLD.  Checked before processing a silent-input buffer;
+        /// if true the buffer can be skipped entirely.
+        /// </summary>
+        bool StatesAreSilent()
+            => Math.Abs(s1_L1) < SILENCE_THRESHOLD
+            && Math.Abs(s2_L1) < SILENCE_THRESHOLD
+            && Math.Abs(s1_R1) < SILENCE_THRESHOLD
+            && Math.Abs(s2_R1) < SILENCE_THRESHOLD
+            && Math.Abs(s1_L2) < SILENCE_THRESHOLD
+            && Math.Abs(s2_L2) < SILENCE_THRESHOLD
+            && Math.Abs(s1_R2) < SILENCE_THRESHOLD
+            && Math.Abs(s2_R2) < SILENCE_THRESHOLD;
+
+        // =========================================================================
+        // TPT SVF (Zavalishin) — unconditionally stable at all cutoff frequencies
         // =========================================================================
 
         /// <summary>
         /// One sample of a Topology-Preserving Transform State Variable Filter.
         ///
-        /// Unconditionally stable for all fc in (0, sr/2) at any resonance.
-        /// Solves the two integrator feedback equations algebraically before
-        /// updating state, so there is no frequency at which the filter diverges.
+        /// Derivation:
+        ///   hp  = x  −  2R·v1  −  v2
+        ///   v1  = g·hp + s1                (trapezoidal integrator 1)
+        ///   v2  = g·v1 + s2                (trapezoidal integrator 2)
         ///
-        /// Parameters:
-        ///   x        – input sample
-        ///   g        – frequency coefficient: tan(π·fc/sr)
-        ///   R        – damping: 1.0 = flat/Butterworth, ~0 = near self-oscillation
-        ///   s1, s2   – integrator states (modified in place)
+        ///   Substituting and collecting hp terms:
+        ///   hp·(1 + 2R·g + g²) = x − (2R + g)·s1 − s2
         ///
-        /// Outputs:
-        ///   hp       – high-pass
-        ///   bp       – band-pass
-        ///   lp       – low-pass  (also readable as s2 after the call)
-        ///   notch    – notch / band-reject (lp + hp)
+        ///   Note: coefficient on s1 is (2R + g), not just 2R.
+        ///   The g·s1 term is small at low frequencies but grows with g,
+        ///   so omitting it causes LP output loss and instability near Nyquist.
         /// </summary>
         static void TptSvfStep(
             double x, double g, double R,
-            ref double s1,   ref double s2,
-            out double hp,   out double bp,
-            out double lp,   out double notch)
+            ref double s1,  ref double s2,
+            out double hp,  out double bp,
+            out double lp,  out double notch)
         {
-            // Full derivation:
-            //   hp  = x  −  2R·v1  −  v2             (SVF definition)
-            //   v1  = g·hp + s1                       (trapezoidal integrator 1)
-            //   v2  = g·v1 + s2                       (trapezoidal integrator 2)
-            //
-            // Substitute v1 and v2 into the hp equation and collect hp terms:
-            //   hp + 2R·(g·hp + s1) + (g²·hp + g·s1 + s2) = x
-            //   hp·(1 + 2R·g + g²)                         = x − (2R + g)·s1 − s2
-            //
-            // Note: the coefficient on s1 is (2R + g), NOT just 2R.
-            // The g·s1 term is small at low frequencies but grows with g,
-            // so omitting it causes a progressive drop in LP output and
-            // instability as the cutoff approaches Nyquist.
             double denom = 1.0 + 2.0 * R * g + g * g;
             hp    = (x - (2.0 * R + g) * s1 - s2) / denom;
             bp    = g * hp + s1;
