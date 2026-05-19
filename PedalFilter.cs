@@ -1,4 +1,4 @@
-// Pedal Filter – ReBuzz managed effect machine  (v6)
+// Pedal Filter – ReBuzz managed effect machine  (v7)
 //
 // Multi-mode filter with:
 //   • Low Pass / High Pass / Band Pass / Band Reject (Notch) modes
@@ -7,8 +7,30 @@
 //   • LFO    – 5 waveforms, free-running or tempo-synced (14 divisions)
 //   • Stereo LFO phase offset
 //   • Wet/dry mix
-//   • CPU silence detection: stops processing when input is silent and
-//     filter state has fully drained
+//   • CPU silence detection (v7 fix — see notes below)
+//
+// Silence detection — v7 corrections
+// ────────────────────────────────────
+// Three bugs in the v6 silence path:
+//
+// 1. WM_READ is unreliable.  ReBuzz may not clear WM_READ on the
+//    EffectBlock mode flags when the upstream machine returns false.
+//    Relying on it meant the silence gate never fired.
+//    Fix: scan the input buffer directly for non-zero samples.
+//
+// 2. Denormal-number CPU spike.  SVF integrator states decaying toward
+//    zero on silent input enter the IEEE 754 denormal range.  On x64 .NET
+//    without DAZ/FTZ, every arithmetic op on a denormal triggers a
+//    microcode trap that is ~100× slower than normal FP.  This keeps CPU
+//    elevated long after the output is inaudible.
+//    Fix: flush states to 0 after every integrator update whenever they
+//    drop below 1e-25 — well above the denormal zone, well below audibility.
+//
+// 3. Silence threshold was calibrated for ±1 signals.  ReBuzz effect
+//    machines operate at ±32768 (16-bit integer scale).  A threshold of
+//    0.001 is ~−150 dBFS at that scale, which the states never naturally
+//    reach at high resonance / low cutoff within any reasonable time.
+//    Fix: raise threshold to 1.0 (≈ −90 dBFS relative to 32768).
 //
 // TPT SVF (Zavalishin) is unconditionally stable at all cutoff frequencies.
 //
@@ -60,26 +82,29 @@ namespace WDE.PedalFilter
         readonly IBuzzMachineHost host;
 
         // ── TPT SVF integrator states ─────────────────────────────────────────
-        // s1 = first integrator  (tracks band-pass)
-        // s2 = second integrator (tracks low-pass)
         double s1_L1, s2_L1;   // Left  stage 1
         double s1_R1, s2_R1;   // Right stage 1
         double s1_L2, s2_L2;   // Left  stage 2  (4-pole only)
         double s1_R2, s2_R2;   // Right stage 2  (4-pole only)
 
         // ── LFO ──────────────────────────────────────────────────────────────
-        double lfoPhaseL;   // normalised 0..1
+        double lfoPhaseL;
 
         // ── Drive peak tracker ────────────────────────────────────────────────
         double _drivePeakL = 1e-6;
         double _drivePeakR = 1e-6;
 
-        // ── Silence detection threshold ───────────────────────────────────────
-        // Absolute value below which a sample or integrator state is considered
-        // inaudible.  −120 dBFS relative to Buzz full-scale (±32768):
-        //   32768 × 10^(−120/20) ≈ 0.033
-        // Using a slightly tighter value keeps tails clean without wasting CPU.
-        const double SILENCE_THRESHOLD = 0.001;
+        // ── Silence detection ─────────────────────────────────────────────────
+        // Threshold at which an integrator state is considered inaudible.
+        // ReBuzz effect machines run at ±32768 (16-bit integer scale).
+        // 1.0 ≈ −90 dBFS relative to 32768 full-scale.
+        const double SILENCE_THRESHOLD = 1.0;
+
+        // ── Denormal flush threshold ──────────────────────────────────────────
+        // IEEE 754 double denormals begin around 2.2e−308.  Values below
+        // ~1e−25 are inaudible at any realistic audio scale and must be
+        // clamped to 0 to avoid the microcode-trap CPU penalty.
+        const double DENORMAL_THRESHOLD = 1e-25;
 
         // ── Tempo-sync division table ─────────────────────────────────────────
         static readonly double[] DivBeats =
@@ -100,7 +125,6 @@ namespace WDE.PedalFilter
              1.0 / 6.0,  // 13 – 1/16 Triplet
         };
 
-        // ── Constructor ───────────────────────────────────────────────────────
         public PedalFilterMachine(IBuzzMachineHost host) => this.host = host;
 
         // =========================================================================
@@ -118,7 +142,7 @@ namespace WDE.PedalFilter
 
         [ParameterDecl(
             Name        = "Slope",
-            Description = "Filter slope: 12 dB/oct (2-pole) or 24 dB/oct (4-pole, cascaded TPT SVF)",
+            Description = "Filter slope: 12 dB/oct (2-pole) or 24 dB/oct (4-pole)",
             MinValue    = 0,
             MaxValue    = 1,
             DefValue    = 0,
@@ -220,36 +244,35 @@ namespace WDE.PedalFilter
 
         public bool Work(Sample[] output, Sample[] input, int n, WorkModes mode)
         {
-            // ── Silence detection ─────────────────────────────────────────────
+            // ── Silence gate ──────────────────────────────────────────────────
             //
-            // ReBuzz sets WorkModes.WM_READ when the upstream machine is
-            // producing a non-silent signal.  When that flag is absent, the
-            // input buffer is silent (all zeros or not filled at all).
+            // Step 1: check whether the input buffer actually contains signal.
+            // We scan the buffer directly rather than relying on WM_READ —
+            // ReBuzz does not reliably clear WM_READ on the EffectBlock mode
+            // flags when the upstream machine returns false.
             //
-            // We must NOT return false immediately when input goes silent —
-            // the filter integrators hold energy that must drain first or we
-            // cut off resonant tails with a click.  Instead:
+            // Step 2: if input is silent AND all integrator states have decayed
+            // below the inaudible threshold, return false immediately.
+            // ReBuzz interprets false as "output is silence" and will stop
+            // calling Work() until a non-silent upstream buffer arrives.
             //
-            //   • If input is silent AND all integrator states are already
-            //     below the inaudible threshold: return false right away
-            //     (states are already zero, nothing to drain).
-            //
-            //   • If input is silent BUT integrators still hold energy:
-            //     run the full processing loop this buffer with silent input
-            //     so the states continue decaying naturally.  Return true so
-            //     ReBuzz keeps calling us until they drain.
-            //
-            //   • If input is live: always run normally and return true.
-            //
-            // When we return false, ReBuzz marks our output as silent and
-            // stops calling Work() until a new non-silent input arrives.
-            // At that point the integrator states are at or below
-            // SILENCE_THRESHOLD, so there is no click on resumption.
+            // If input is silent but states still hold energy (resonant tail),
+            // we fall through to the normal processing loop with a zeroed input
+            // buffer.  The integrators drain naturally, helped by the denormal
+            // flush inside TptSvfStep that prevents the slow-path FP trap.
 
-            bool inputActive = (mode & WorkModes.WM_READ) != 0;
+            bool inputActive = false;
+            for (int i = 0; i < n; i++)
+            {
+                if (input[i].L != 0f || input[i].R != 0f)
+                {
+                    inputActive = true;
+                    break;
+                }
+            }
 
             if (!inputActive && StatesAreSilent())
-                return false;   // nothing to process, nothing to drain
+                return false;
 
             // ------------------------------------------------------------------
             // Block-level constants
@@ -304,14 +327,14 @@ namespace WDE.PedalFilter
                 double gR = Math.Tan(Math.PI * fcR / sr);
 
                 // Drive
-                // When Drive = 0 the input passes through unmodified.
-                // When Drive > 0 a normalised tanh saturator is applied:
-                //   divide by running peak  →  tanh with drive gain  →  multiply back.
-                // This makes the saturation character independent of signal level.
+                // Drive = 0: exact bypass, no gain change.
+                // Drive > 0: normalised tanh saturator — signal is divided by
+                // a running peak before tanh and multiplied back after, making
+                // the saturation character independent of input amplitude.
                 double inL, inR;
                 if (Drive > 0)
                 {
-                    const double peakDecay = 0.9999;   // ≈ 160 ms half-life @ 44.1 kHz
+                    const double peakDecay = 0.9999;
                     _drivePeakL = Math.Max(Math.Abs(input[i].L), _drivePeakL * peakDecay);
                     _drivePeakR = Math.Max(Math.Abs(input[i].R), _drivePeakR * peakDecay);
                     inL = Math.Tanh(input[i].L / _drivePeakL * driveGain) * _drivePeakL;
@@ -324,6 +347,8 @@ namespace WDE.PedalFilter
                 }
 
                 // TPT SVF stage 1
+                // TptSvfStep flushes integrator states to 0 when they fall
+                // below DENORMAL_THRESHOLD, preventing the FP-denormal CPU spike.
                 TptSvfStep(inL, gL, R, ref s1_L1, ref s2_L1,
                            out double hp1L, out double bp1L, out double lp1L, out double no1L);
                 TptSvfStep(inR, gR, R, ref s1_R1, ref s2_R1,
@@ -338,7 +363,6 @@ namespace WDE.PedalFilter
                 }
                 else
                 {
-                    // 4-pole: feed stage-1 selected output into stage 2
                     double f1L = SelectMode(filterMode, lp1L, hp1L, bp1L, no1L);
                     double f1R = SelectMode(filterMode, lp1R, hp1R, bp1R, no1R);
 
@@ -359,14 +383,9 @@ namespace WDE.PedalFilter
         }
 
         // =========================================================================
-        // Silence helper
+        // Silence check
         // =========================================================================
 
-        /// <summary>
-        /// Returns true when all four pairs of TPT integrator states are below
-        /// SILENCE_THRESHOLD.  Checked before processing a silent-input buffer;
-        /// if true the buffer can be skipped entirely.
-        /// </summary>
         bool StatesAreSilent()
             => Math.Abs(s1_L1) < SILENCE_THRESHOLD
             && Math.Abs(s2_L1) < SILENCE_THRESHOLD
@@ -378,25 +397,21 @@ namespace WDE.PedalFilter
             && Math.Abs(s2_R2) < SILENCE_THRESHOLD;
 
         // =========================================================================
-        // TPT SVF (Zavalishin) — unconditionally stable at all cutoff frequencies
+        // TPT SVF (Zavalishin)
         // =========================================================================
 
         /// <summary>
         /// One sample of a Topology-Preserving Transform State Variable Filter.
         ///
         /// Derivation:
-        ///   hp  = x  −  2R·v1  −  v2
-        ///   v1  = g·hp + s1                (trapezoidal integrator 1)
-        ///   v2  = g·v1 + s2                (trapezoidal integrator 2)
-        ///
-        ///   Substituting and collecting hp terms:
         ///   hp·(1 + 2R·g + g²) = x − (2R + g)·s1 − s2
         ///
-        ///   Note: coefficient on s1 is (2R + g), not just 2R.
-        ///   The g·s1 term is small at low frequencies but grows with g,
-        ///   so omitting it causes LP output loss and instability near Nyquist.
+        /// After updating s1 and s2, both are flushed to 0 if they fall below
+        /// DENORMAL_THRESHOLD.  Without this flush, decaying integrator states
+        /// enter the IEEE 754 denormal range and trigger a ~100× CPU penalty
+        /// on x64 .NET (which does not set DAZ/FTZ by default).
         /// </summary>
-        static void TptSvfStep(
+        void TptSvfStep(
             double x, double g, double R,
             ref double s1,  ref double s2,
             out double hp,  out double bp,
@@ -408,9 +423,14 @@ namespace WDE.PedalFilter
             lp    = g * bp + s2;
             notch = lp + hp;
 
-            // Advance trapezoidal integrator states
             s1 = 2.0 * bp - s1;
             s2 = 2.0 * lp - s2;
+
+            // Denormal flush — runs every sample.
+            // Threshold 1e-25 is ~13 orders above the denormal zone
+            // and ~500 dBFS below any audible signal at ±32768 scale.
+            if (s1 > -DENORMAL_THRESHOLD && s1 < DENORMAL_THRESHOLD) s1 = 0.0;
+            if (s2 > -DENORMAL_THRESHOLD && s2 < DENORMAL_THRESHOLD) s2 = 0.0;
         }
 
         // =========================================================================
@@ -429,7 +449,6 @@ namespace WDE.PedalFilter
                 _                     => lp,
             };
 
-        /// <summary>Returns LFO value in −1..+1 for normalised phase 0..1.</summary>
         static double EvalLfo(LfoWaveform w, double ph)
             => w switch
             {
